@@ -133,15 +133,18 @@
         reboot: "{{ patch_reboot }}"
         reboot_timeout: "{{ patch_reboot_timeout }}"
       register: patch_result
+      when:
+        - enable_patch_install | default(false) | bool
 
-    - name: "Mostrar resultado de instalación"
+    - name: "Mostrar resultado de instalacion"
       ansible.builtin.debug:
         msg:
           - "Servidor: {{ inventory_hostname }}"
-          - "Actualizaciones encontradas: {{ patch_result.found_update_count | default(0) }}"
-          - "Actualizaciones instaladas: {{ patch_result.installed_update_count | default(0) }}"
-          - "Reinicio requerido: {{ patch_result.reboot_required | default(false) }}"
-          - "Fallidas: {{ patch_result.failed_update_count | default(0) }}"
+          - "Instalacion habilitada: {{ enable_patch_install | default(false) }}"
+          - "Actualizaciones encontradas: {{ patch_result.found_update_count | default('No ejecutado') }}"
+          - "Actualizaciones instaladas: {{ patch_result.installed_update_count | default('No ejecutado') }}"
+          - "Reinicio requerido: {{ patch_result.reboot_required | default('No ejecutado') }}"
+          - "Fallidas: {{ patch_result.failed_update_count | default('No ejecutado') }}"
 
 
 - name: "POSTCHECK | Validación posterior al parchado"

@@ -10,6 +10,7 @@ windows_update_categories:
   - CriticalUpdates
   - UpdateRollups
 
+enable_patch_install: false
 patch_reboot: false
 patch_reboot_timeout: 3600
 
