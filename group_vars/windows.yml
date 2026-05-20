@@ -1,0 +1,21 @@
+---
+ansible_connection: winrm
+ansible_port: 5985
+ansible_winrm_transport: ntlm
+ansible_winrm_server_cert_validation: ignore
+ansible_shell_type: powershell
+
+windows_update_categories:
+  - SecurityUpdates
+  - CriticalUpdates
+  - UpdateRollups
+
+patch_reboot: false
+patch_reboot_timeout: 3600
+
+enable_vmware_snapshot: false
+enable_teams_notification: false
+
+vmware_validate_certs: false
+vmware_datacenter: "Datacenter"
+vmware_folder: "/"

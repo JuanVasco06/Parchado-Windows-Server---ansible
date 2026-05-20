@@ -1,0 +1,225 @@
+---
+- name: "INICIO | Mostrar inicio del flujo de parchado"
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: "Mostrar información inicial"
+      ansible.builtin.debug:
+        msg:
+          - "Inicio de flujo de parchado Windows Server 2019"
+          - "Ejecutado desde AWX"
+          - "Ambiente: {{ ambiente_objetivo | default('PRUEBAS') }}"
+          - "Snapshot VMware habilitado: {{ enable_vmware_snapshot | default(false) }}"
+          - "Notificación Teams habilitada: {{ enable_teams_notification | default(false) }}"
+          - "Reinicio habilitado: {{ patch_reboot | default(false) }}"
+
+
+- name: "VALIDACION | Precheck y busqueda de parches en Windows"
+  hosts: windows
+  gather_facts: false
+  serial: 1
+
+  tasks:
+    - name: "Validar conectividad WinRM"
+      ansible.windows.win_ping:
+      register: win_ping_result
+
+    - name: "Obtener hostname"
+      ansible.windows.win_shell: hostname
+      register: hostname_result
+      changed_when: false
+
+    - name: "Obtener información del sistema operativo"
+      ansible.windows.win_shell: |
+        Get-CimInstance Win32_OperatingSystem |
+        Select-Object Caption, Version, BuildNumber, LastBootUpTime |
+        ConvertTo-Json -Compress
+      register: os_info
+      changed_when: false
+
+    - name: "Validar espacio libre en disco C"
+      ansible.windows.win_shell: |
+        Get-PSDrive C |
+        Select-Object Name,
+                      @{Name="FreeGB";Expression={[math]::Round($_.Free/1GB,2)}},
+                      @{Name="UsedGB";Expression={[math]::Round($_.Used/1GB,2)}} |
+        ConvertTo-Json -Compress
+      register: disk_info
+      changed_when: false
+
+    - name: "Validar si hay reinicio pendiente"
+      ansible.windows.win_shell: |
+        $pending = $false
+
+        if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
+          $pending = $true
+        }
+
+        if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
+          $pending = $true
+        }
+
+        Write-Output $pending
+      register: pending_reboot_precheck
+      changed_when: false
+
+    - name: "Buscar actualizaciones disponibles sin instalar"
+      ansible.windows.win_updates:
+        category_names: "{{ windows_update_categories }}"
+        state: searched
+      register: updates_search_result
+
+    - name: "Mostrar resumen de precheck"
+      ansible.builtin.debug:
+        msg:
+          - "Servidor inventario: {{ inventory_hostname }}"
+          - "IP: {{ ansible_host }}"
+          - "Hostname: {{ hostname_result.stdout | trim }}"
+          - "SO: {{ os_info.stdout | trim }}"
+          - "Disco C: {{ disk_info.stdout | trim }}"
+          - "Reinicio pendiente antes de parchar: {{ pending_reboot_precheck.stdout | trim }}"
+          - "Actualizaciones encontradas: {{ updates_search_result.found_update_count | default(0) }}"
+
+
+- name: "VMWARE | Crear snapshot previo al parchado"
+  hosts: windows
+  gather_facts: false
+  serial: 1
+
+  vars:
+    snapshot_name: "AWX_PRE_PATCH_{{ inventory_hostname }}_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    vmware_hostname: "{{ lookup('env', 'VMWARE_HOST') | default('', true) }}"
+    vmware_username: "{{ lookup('env', 'VMWARE_USER') | default('', true) }}"
+    vmware_password: "{{ lookup('env', 'VMWARE_PASSWORD') | default('', true) }}"
+
+  tasks:
+    - name: "Crear snapshot en VMware antes del parchado"
+      vmware.vmware.vm_snapshot:
+        hostname: "{{ vmware_hostname }}"
+        username: "{{ vmware_username }}"
+        password: "{{ vmware_password }}"
+        validate_certs: "{{ vmware_validate_certs }}"
+        datacenter: "{{ vmware_datacenter }}"
+        name: "{{ vmware_vm_name }}"
+        snapshot_name: "{{ snapshot_name }}"
+        description: "Snapshot previo a parchado Windows ejecutado desde AWX sobre {{ inventory_hostname }}"
+        state: present
+      delegate_to: localhost
+      register: snapshot_result
+      when:
+        - enable_vmware_snapshot | default(false) | bool
+        - vmware_hostname | length > 0
+        - vmware_username | length > 0
+        - vmware_password | length > 0
+        - vmware_vm_name is defined
+
+    - name: "Mostrar resultado snapshot"
+      ansible.builtin.debug:
+        var: snapshot_result
+      when:
+        - enable_vmware_snapshot | default(false) | bool
+
+
+- name: "PATCH | Instalar actualizaciones Windows Server 2019"
+  hosts: windows
+  gather_facts: false
+  serial: 1
+
+  tasks:
+    - name: "Instalar actualizaciones críticas y de seguridad"
+      ansible.windows.win_updates:
+        category_names: "{{ windows_update_categories }}"
+        reboot: "{{ patch_reboot }}"
+        reboot_timeout: "{{ patch_reboot_timeout }}"
+      register: patch_result
+
+    - name: "Mostrar resultado de instalación"
+      ansible.builtin.debug:
+        msg:
+          - "Servidor: {{ inventory_hostname }}"
+          - "Actualizaciones encontradas: {{ patch_result.found_update_count | default(0) }}"
+          - "Actualizaciones instaladas: {{ patch_result.installed_update_count | default(0) }}"
+          - "Reinicio requerido: {{ patch_result.reboot_required | default(false) }}"
+          - "Fallidas: {{ patch_result.failed_update_count | default(0) }}"
+
+
+- name: "POSTCHECK | Validación posterior al parchado"
+  hosts: windows
+  gather_facts: false
+  serial: 1
+
+  tasks:
+    - name: "Obtener último arranque después del parchado"
+      ansible.windows.win_shell: |
+        (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+      register: last_boot_post
+      changed_when: false
+
+    - name: "Obtener últimos hotfix instalados"
+      ansible.windows.win_shell: |
+        Get-HotFix |
+        Sort-Object InstalledOn -Descending |
+        Select-Object -First 10 HotFixID, Description, InstalledOn |
+        ConvertTo-Json -Compress
+      register: hotfix_post
+      changed_when: false
+
+    - name: "Validar servicios automáticos detenidos"
+      ansible.windows.win_shell: |
+        Get-Service |
+        Where-Object {$_.StartType -eq "Automatic" -and $_.Status -ne "Running"} |
+        Select-Object Name, DisplayName, Status, StartType |
+        ConvertTo-Json -Compress
+      register: stopped_auto_services
+      changed_when: false
+      failed_when: false
+
+    - name: "Validar servicios críticos definidos en inventario"
+      ansible.windows.win_shell: |
+        $services = @({{ servicios_criticos | default([]) | to_json }})
+        $result = foreach ($svc in $services) {
+          Get-Service -Name $svc -ErrorAction SilentlyContinue |
+          Select-Object Name, DisplayName, Status
+        }
+        $result | ConvertTo-Json -Compress
+      register: critical_services_status
+      changed_when: false
+      failed_when: false
+      when:
+        - servicios_criticos is defined
+        - servicios_criticos | length > 0
+
+    - name: "Mostrar postcheck"
+      ansible.builtin.debug:
+        msg:
+          - "Servidor: {{ inventory_hostname }}"
+          - "Ultimo arranque: {{ last_boot_post.stdout | trim }}"
+          - "Ultimos hotfix: {{ hotfix_post.stdout | trim }}"
+          - "Servicios automaticos detenidos: {{ stopped_auto_services.stdout | trim }}"
+          - "Servicios criticos: {{ critical_services_status.stdout | default('No definidos') | trim }}"
+
+
+- name: "CIERRE | Notificar resultado final a Teams"
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    teams_webhook_url: "{{ lookup('env', 'TEAMS_WEBHOOK_URL') | default('', true) }}"
+
+  tasks:
+    - name: "Notificar finalización a Teams"
+      ansible.builtin.uri:
+        url: "{{ teams_webhook_url }}"
+        method: POST
+        body_format: json
+        headers:
+          Content-Type: "application/json"
+        body:
+          text: "Finalizó el flujo de parchado Windows Server 2019 desde AWX. Validar logs del Job para evidencias."
+        status_code:
+          - 200
+          - 202
+      when:
+        - enable_teams_notification | default(false) | bool
+        - teams_webhook_url | length > 0
