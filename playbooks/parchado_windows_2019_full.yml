@@ -127,7 +127,7 @@
   serial: 1
 
   tasks:
-    - name: "Instalar actualizaciones críticas y de seguridad"
+    - name: "Instalar todas las actualizaciones disponibles de Windows"
       ansible.windows.win_updates:
         category_names: "{{ windows_update_categories }}"
         reboot: "{{ patch_reboot }}"
@@ -141,11 +141,11 @@
         msg:
           - "Servidor: {{ inventory_hostname }}"
           - "Instalacion habilitada: {{ enable_patch_install | default(false) }}"
+          - "Categorias incluidas: {{ windows_update_categories }}"
           - "Actualizaciones encontradas: {{ patch_result.found_update_count | default('No ejecutado') }}"
           - "Actualizaciones instaladas: {{ patch_result.installed_update_count | default('No ejecutado') }}"
           - "Reinicio requerido: {{ patch_result.reboot_required | default('No ejecutado') }}"
           - "Fallidas: {{ patch_result.failed_update_count | default('No ejecutado') }}"
-
 
 - name: "POSTCHECK | Validación posterior al parchado"
   hosts: windows
