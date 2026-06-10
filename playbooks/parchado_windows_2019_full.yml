@@ -7,12 +7,14 @@
     - name: "Mostrar información inicial"
       ansible.builtin.debug:
         msg:
-          - "Inicio de flujo de parchado Windows Server 2019"
+          - "Inicio de flujo de parchado Windows Server"
           - "Ejecutado desde AWX"
           - "Ambiente: {{ ambiente_objetivo | default('PRUEBAS') }}"
           - "Snapshot VMware habilitado: {{ enable_vmware_snapshot | default(false) }}"
           - "Notificación Teams habilitada: {{ enable_teams_notification | default(false) }}"
+          - "Instalación habilitada: {{ enable_patch_install | default(false) }}"
           - "Reinicio habilitado: {{ patch_reboot | default(false) }}"
+          - "Categorías Windows Update: {{ windows_update_categories | default(['*']) }}"
 
 
 - name: "VALIDACION | Precheck y busqueda de parches en Windows"
@@ -48,7 +50,7 @@
       register: disk_info
       changed_when: false
 
-    - name: "Validar si hay reinicio pendiente"
+    - name: "Validar si hay reinicio pendiente antes de parchar"
       ansible.windows.win_shell: |
         $pending = $false
 
@@ -60,15 +62,36 @@
           $pending = $true
         }
 
+        if (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations") {
+          $pending = $true
+        }
+
         Write-Output $pending
       register: pending_reboot_precheck
       changed_when: false
 
+    - name: "Validar procesos activos de Windows Update antes de iniciar"
+      ansible.windows.win_shell: |
+        $processes = Get-Process -ErrorAction SilentlyContinue |
+          Where-Object { $_.ProcessName -match "wusa|TiWorker|TrustedInstaller|UsoClient|MoUsoCoreWorker" } |
+          Select-Object ProcessName, Id, CPU, StartTime
+
+        if ($processes) {
+          $processes | ConvertTo-Json -Compress
+        } else {
+          Write-Output "SIN_PROCESOS_UPDATE_ACTIVOS"
+        }
+      register: update_processes_precheck
+      changed_when: false
+      failed_when: false
+
     - name: "Buscar actualizaciones disponibles sin instalar"
       ansible.windows.win_updates:
-        category_names: "{{ windows_update_categories }}"
+        category_names: "{{ windows_update_categories | default(['*']) }}"
         state: searched
+        log_path: C:\Windows\Temp\ansible-win-updates-search.log
       register: updates_search_result
+      failed_when: false
 
     - name: "Mostrar resumen de precheck"
       ansible.builtin.debug:
@@ -79,7 +102,9 @@
           - "SO: {{ os_info.stdout | trim }}"
           - "Disco C: {{ disk_info.stdout | trim }}"
           - "Reinicio pendiente antes de parchar: {{ pending_reboot_precheck.stdout | trim }}"
+          - "Procesos Windows Update activos: {{ update_processes_precheck.stdout | trim }}"
           - "Actualizaciones encontradas: {{ updates_search_result.found_update_count | default(0) }}"
+          - "Actualizaciones fallidas en búsqueda: {{ updates_search_result.failed_update_count | default(0) }}"
 
 
 - name: "VMWARE | Crear snapshot previo al parchado"
@@ -99,7 +124,7 @@
         hostname: "{{ vmware_hostname }}"
         username: "{{ vmware_username }}"
         password: "{{ vmware_password }}"
-        validate_certs: "{{ vmware_validate_certs }}"
+        validate_certs: "{{ vmware_validate_certs | default(false) }}"
         datacenter: "{{ vmware_datacenter }}"
         name: "{{ vmware_vm_name }}"
         snapshot_name: "{{ snapshot_name }}"
@@ -109,6 +134,7 @@
       register: snapshot_result
       when:
         - enable_vmware_snapshot | default(false) | bool
+        - enable_patch_install | default(false) | bool
         - vmware_hostname | length > 0
         - vmware_username | length > 0
         - vmware_password | length > 0
@@ -121,31 +147,113 @@
         - enable_vmware_snapshot | default(false) | bool
 
 
-- name: "PATCH | Instalar actualizaciones Windows Server 2019"
+- name: "PATCH | Preparar e instalar actualizaciones Windows Server"
   hosts: windows
   gather_facts: false
   serial: 1
 
   tasks:
-    - name: "Instalar todas las actualizaciones disponibles de Windows"
-      ansible.windows.win_updates:
-        category_names: "{{ windows_update_categories }}"
-        reboot: "{{ patch_reboot }}"
-        reboot_timeout: "{{ patch_reboot_timeout }}"
-      register: patch_result
+    - name: "Asegurar servicios requeridos para Windows Update"
+      ansible.windows.win_service:
+        name: "{{ item }}"
+        state: started
+      loop:
+        - wuauserv
+        - bits
+        - cryptsvc
+        - TrustedInstaller
       when:
         - enable_patch_install | default(false) | bool
 
-    - name: "Mostrar resultado de instalacion"
+    - name: "Actualizar firmas de Microsoft Defender antes de Windows Update"
+      ansible.windows.win_shell: |
+        try {
+          if (Get-Command Update-MpSignature -ErrorAction SilentlyContinue) {
+            Update-MpSignature -ErrorAction Stop
+            Write-Output "Defender signatures updated successfully"
+          } else {
+            Write-Output "Update-MpSignature command not available"
+          }
+        }
+        catch {
+          Write-Output "Defender signature update failed or Defender not available: $($_.Exception.Message)"
+          exit 0
+        }
+      register: defender_update
+      changed_when: "'updated successfully' in defender_update.stdout"
+      failed_when: false
+      when:
+        - enable_patch_install | default(false) | bool
+
+    - name: "Mostrar resultado actualización Defender"
+      ansible.builtin.debug:
+        msg:
+          - "Resultado Defender:"
+          - "{{ defender_update.stdout | default('No ejecutado') | trim }}"
+      when:
+        - enable_patch_install | default(false) | bool
+
+    - name: "Forzar escaneo y descarga de Windows Update similar a Retry"
+      ansible.windows.win_shell: |
+        try {
+          UsoClient StartScan
+          Start-Sleep -Seconds 20
+          UsoClient StartDownload
+          Start-Sleep -Seconds 30
+          UsoClient StartInstall
+          Start-Sleep -Seconds 20
+          Write-Output "UsoClient retry commands executed"
+        }
+        catch {
+          Write-Output "UsoClient execution failed: $($_.Exception.Message)"
+          exit 0
+        }
+      register: windows_update_retry_trigger
+      changed_when: true
+      failed_when: false
+      when:
+        - enable_patch_install | default(false) | bool
+
+    - name: "Esperar antes de instalar para evitar conflicto con descargas en progreso"
+      ansible.windows.win_shell: |
+        Start-Sleep -Seconds 60
+        Write-Output "Espera completada"
+      changed_when: false
+      when:
+        - enable_patch_install | default(false) | bool
+
+    - name: "Instalar todas las actualizaciones disponibles de Windows con reintentos"
+      ansible.windows.win_updates:
+        category_names: "{{ windows_update_categories | default(['*']) }}"
+        reboot: "{{ patch_reboot | default(true) }}"
+        reboot_timeout: "{{ patch_reboot_timeout | default(7200) }}"
+        log_path: C:\Windows\Temp\ansible-win-updates.log
+      register: patch_result
+      retries: "{{ patch_retries | default(3) }}"
+      delay: "{{ patch_retry_delay | default(180) }}"
+      until: patch_result.failed_update_count | default(0) | int == 0
+      when:
+        - enable_patch_install | default(false) | bool
+
+    - name: "Mostrar resultado de instalación"
       ansible.builtin.debug:
         msg:
           - "Servidor: {{ inventory_hostname }}"
-          - "Instalacion habilitada: {{ enable_patch_install | default(false) }}"
-          - "Categorias incluidas: {{ windows_update_categories }}"
+          - "Instalación habilitada: {{ enable_patch_install | default(false) }}"
+          - "Categorías incluidas: {{ windows_update_categories | default(['*']) }}"
           - "Actualizaciones encontradas: {{ patch_result.found_update_count | default('No ejecutado') }}"
           - "Actualizaciones instaladas: {{ patch_result.installed_update_count | default('No ejecutado') }}"
           - "Reinicio requerido: {{ patch_result.reboot_required | default('No ejecutado') }}"
           - "Fallidas: {{ patch_result.failed_update_count | default('No ejecutado') }}"
+          - "Log Windows Update: C:\\Windows\\Temp\\ansible-win-updates.log"
+
+    - name: "Fallar si quedaron actualizaciones fallidas"
+      ansible.builtin.fail:
+        msg: "Windows Update terminó con {{ patch_result.failed_update_count }} actualizaciones fallidas. Revisar C:\\Windows\\Temp\\ansible-win-updates.log"
+      when:
+        - enable_patch_install | default(false) | bool
+        - patch_result.failed_update_count | default(0) | int > 0
+
 
 - name: "POSTCHECK | Validación posterior al parchado"
   hosts: windows
@@ -159,14 +267,51 @@
       register: last_boot_post
       changed_when: false
 
+    - name: "Validar si hay reinicio pendiente después del parchado"
+      ansible.windows.win_shell: |
+        $pending = $false
+
+        if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
+          $pending = $true
+        }
+
+        if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
+          $pending = $true
+        }
+
+        if (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations") {
+          $pending = $true
+        }
+
+        Write-Output $pending
+      register: pending_reboot_postcheck
+      changed_when: false
+
     - name: "Obtener últimos hotfix instalados"
       ansible.windows.win_shell: |
         Get-HotFix |
         Sort-Object InstalledOn -Descending |
-        Select-Object -First 10 HotFixID, Description, InstalledOn |
+        Select-Object -First 15 HotFixID, Description, InstalledOn, InstalledBy |
         ConvertTo-Json -Compress
       register: hotfix_post
       changed_when: false
+
+    - name: "Buscar nuevamente actualizaciones disponibles después del parchado"
+      ansible.windows.win_updates:
+        category_names: "{{ windows_update_categories | default(['*']) }}"
+        state: searched
+        log_path: C:\Windows\Temp\ansible-win-updates-postcheck.log
+      register: updates_postcheck_result
+      failed_when: false
+
+    - name: "Consultar eventos recientes de Windows Update"
+      ansible.windows.win_shell: |
+        Get-WinEvent -LogName "Microsoft-Windows-WindowsUpdateClient/Operational" -MaxEvents 30 |
+        Select-Object TimeCreated, Id, Message |
+        ConvertTo-Json -Compress
+      register: windows_update_events
+      changed_when: false
+      failed_when: false
 
     - name: "Validar servicios automáticos detenidos"
       ansible.windows.win_shell: |
@@ -198,9 +343,28 @@
         msg:
           - "Servidor: {{ inventory_hostname }}"
           - "Ultimo arranque: {{ last_boot_post.stdout | trim }}"
+          - "Reinicio pendiente después de parchar: {{ pending_reboot_postcheck.stdout | trim }}"
           - "Ultimos hotfix: {{ hotfix_post.stdout | trim }}"
+          - "Actualizaciones pendientes después del parchado: {{ updates_postcheck_result.found_update_count | default(0) }}"
+          - "Actualizaciones fallidas en postcheck: {{ updates_postcheck_result.failed_update_count | default(0) }}"
           - "Servicios automaticos detenidos: {{ stopped_auto_services.stdout | trim }}"
           - "Servicios criticos: {{ critical_services_status.stdout | default('No definidos') | trim }}"
+          - "Eventos recientes Windows Update: {{ windows_update_events.stdout | default('Sin eventos') | trim }}"
+
+    - name: "Advertir si aún quedan actualizaciones pendientes"
+      ansible.builtin.debug:
+        msg:
+          - "ADVERTENCIA: después del parchado aún se detectan {{ updates_postcheck_result.found_update_count }} actualizaciones pendientes."
+          - "Revisar C:\\Windows\\Temp\\ansible-win-updates-postcheck.log"
+      when:
+        - updates_postcheck_result.found_update_count | default(0) | int > 0
+
+    - name: "Fallar si después del parchado queda reinicio pendiente"
+      ansible.builtin.fail:
+        msg: "El servidor quedó con reinicio pendiente después del parchado. Reiniciar y volver a validar."
+      when:
+        - fail_on_pending_reboot | default(false) | bool
+        - pending_reboot_postcheck.stdout | trim | lower == "true"
 
 
 - name: "CIERRE | Notificar resultado final a Teams"
@@ -219,7 +383,7 @@
         headers:
           Content-Type: "application/json"
         body:
-          text: "Finalizó el flujo de parchado Windows Server 2019 desde AWX. Validar logs del Job para evidencias."
+          text: "Finalizó el flujo de parchado Windows Server desde AWX. Validar logs del Job para evidencias."
         status_code:
           - 200
           - 202
