@@ -1,20 +1,22 @@
----
 ansible_connection: winrm
 ansible_port: 5985
 ansible_winrm_transport: ntlm
 ansible_winrm_server_cert_validation: ignore
 ansible_shell_type: powershell
+ansible_winrm_operation_timeout_sec: 120
+ansible_winrm_read_timeout_sec: 180
 
 windows_update_categories:
   - '*'
 
-enable_patch_install: false
-patch_reboot: false
-patch_reboot_timeout: 3600
-
+enable_patch_install: true
 enable_vmware_snapshot: false
 enable_teams_notification: false
 
-vmware_validate_certs: false
-vmware_datacenter: "Datacenter"
-vmware_folder: "/"
+patch_reboot: true
+patch_reboot_timeout: 7200
+
+patch_retries: 3
+patch_retry_delay: 180
+
+fail_on_pending_reboot: false
