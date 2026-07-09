@@ -10,7 +10,7 @@
           - "Inicio de flujo de parchado Windows Server"
           - "Ejecutado desde AWX"
           - "Ambiente: {{ ambiente_objetivo | default('PRUEBAS') }}"
-          - "Snapshot VMware habilitado: {{ enable_vmware_snapshot | default(false) }}"
+          - "Snapshot/checkpoint habilitado: {{ enable_snapshot | default(false) }}"
           - "Notificación Teams habilitada: {{ enable_teams_notification | default(false) }}"
           - "Instalación habilitada: {{ enable_patch_install | default(false) }}"
           - "Reinicio habilitado: {{ patch_reboot | default(false) }}"
@@ -107,19 +107,20 @@
           - "Actualizaciones fallidas en búsqueda: {{ updates_search_result.failed_update_count | default(0) }}"
 
 
-- name: "VMWARE | Crear snapshot previo al parchado"
+- name: "SNAPSHOT | Crear snapshot/checkpoint previo al parchado (multi-hipervisor)"
   hosts: windows
   gather_facts: false
   serial: 1
 
   vars:
     snapshot_name: "AWX_PRE_PATCH_{{ inventory_hostname }}_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    # Credenciales VMware: se inyectan como variables de entorno en el Execution Environment / credencial AWX
     vmware_hostname: "{{ lookup('env', 'VMWARE_HOST') | default('', true) }}"
     vmware_username: "{{ lookup('env', 'VMWARE_USER') | default('', true) }}"
     vmware_password: "{{ lookup('env', 'VMWARE_PASSWORD') | default('', true) }}"
 
   tasks:
-    - name: "Crear snapshot en VMware antes del parchado"
+    - name: "VMware | Crear snapshot vía vCenter"
       vmware.vmware.vm_snapshot:
         hostname: "{{ vmware_hostname }}"
         username: "{{ vmware_username }}"
@@ -128,23 +129,53 @@
         datacenter: "{{ vmware_datacenter }}"
         name: "{{ vmware_vm_name }}"
         snapshot_name: "{{ snapshot_name }}"
-        description: "Snapshot previo a parchado Windows ejecutado desde AWX sobre {{ inventory_hostname }}"
+        description: "Snapshot previo a parchado Windows desde AWX sobre {{ inventory_hostname }}"
         state: present
       delegate_to: localhost
-      register: snapshot_result
+      register: snapshot_vmware
       when:
-        - enable_vmware_snapshot | default(false) | bool
+        - enable_snapshot | default(false) | bool
         - enable_patch_install | default(false) | bool
+        - (hypervisor_type | default('')) == 'vmware'
         - vmware_hostname | length > 0
         - vmware_username | length > 0
         - vmware_password | length > 0
         - vmware_vm_name is defined
 
-    - name: "Mostrar resultado snapshot"
-      ansible.builtin.debug:
-        var: snapshot_result
+    - name: "Hyper-V | Crear checkpoint vía PowerShell en el host Hyper-V"
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Checkpoint-VM -Name '{{ vm_name_hypervisor }}' -SnapshotName '{{ snapshot_name }}'
+          Write-Output "Checkpoint '{{ snapshot_name }}' creado para la VM '{{ vm_name_hypervisor }}'"
+      delegate_to: "{{ hyperv_host }}"
+      register: snapshot_hyperv
       when:
-        - enable_vmware_snapshot | default(false) | bool
+        - enable_snapshot | default(false) | bool
+        - enable_patch_install | default(false) | bool
+        - (hypervisor_type | default('')) == 'hyperv'
+        - hyperv_host is defined
+        - vm_name_hypervisor is defined
+
+    - name: "Advertir si el snapshot está habilitado pero el host no define hypervisor_type"
+      ansible.builtin.debug:
+        msg: >
+          ADVERTENCIA: enable_snapshot=true pero {{ inventory_hostname }} no tiene
+          hypervisor_type valido ('vmware' o 'hyperv'). No se creó snapshot/checkpoint.
+      when:
+        - enable_snapshot | default(false) | bool
+        - (hypervisor_type | default('')) not in ['vmware', 'hyperv']
+
+    - name: "Mostrar resultado del snapshot/checkpoint"
+      ansible.builtin.debug:
+        msg:
+          - "Servidor          : {{ inventory_hostname }}"
+          - "Hipervisor        : {{ hypervisor_type | default('no definido') }}"
+          - "Snapshot creado   : {{ snapshot_name }}"
+          - "Resultado VMware  : {{ snapshot_vmware.changed | default('no aplicado') }}"
+          - "Resultado Hyper-V : {{ snapshot_hyperv.output | default('no aplicado') }}"
+      when:
+        - enable_snapshot | default(false) | bool
 
 
 - name: "PATCH | Preparar e instalar actualizaciones Windows Server"
