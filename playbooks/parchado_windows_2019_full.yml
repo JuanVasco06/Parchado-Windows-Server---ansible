@@ -196,6 +196,36 @@
       when:
         - enable_patch_install | default(false) | bool
 
+    - name: "Registrar el servicio Microsoft Update (necesario para que Windows Update vea Defender/Office, no solo parches de SO)"
+      ansible.windows.win_shell: |
+        try {
+          $muServiceId = "7971f918-a847-4430-9279-4a52d1efe18d"
+          $manager = New-Object -ComObject Microsoft.Update.ServiceManager
+          $manager.ClientApplicationID = "AnsibleAWX"
+          $existing = $manager.Services | Where-Object { $_.ServiceID -eq $muServiceId }
+          if ($existing) {
+            Write-Output "Microsoft Update ya estaba registrado"
+          } else {
+            $manager.AddService2($muServiceId, 7, "") | Out-Null
+            Write-Output "Microsoft Update registrado correctamente"
+          }
+        }
+        catch {
+          Write-Output "No se pudo registrar Microsoft Update: $($_.Exception.Message)"
+          exit 0
+        }
+      register: mu_service_result
+      changed_when: "'registrado correctamente' in mu_service_result.stdout"
+      failed_when: false
+      when:
+        - enable_patch_install | default(false) | bool
+
+    - name: "Mostrar resultado del registro de Microsoft Update"
+      ansible.builtin.debug:
+        msg: "{{ mu_service_result.stdout | default('No ejecutado') | trim }}"
+      when:
+        - enable_patch_install | default(false) | bool
+
     - name: "Actualizar firmas de Microsoft Defender antes de Windows Update"
       ansible.windows.win_shell: |
         try {
@@ -253,16 +283,18 @@
       when:
         - enable_patch_install | default(false) | bool
 
-    - name: "Instalar todas las actualizaciones disponibles de Windows con reintentos"
+    - name: "Instalar actualizaciones en ciclo hasta dejar el servidor sin pendientes (equivalente a repetir 'Install now' manualmente)"
       ansible.windows.win_updates:
         category_names: "{{ windows_update_categories | default(['*']) }}"
         reboot: "{{ patch_reboot | default(true) }}"
         reboot_timeout: "{{ patch_reboot_timeout | default(7200) }}"
         log_path: C:\Windows\Temp\ansible-win-updates.log
       register: patch_result
-      retries: "{{ patch_retries | default(3) }}"
+      retries: "{{ patch_max_passes | default(patch_retries) | default(3) }}"
       delay: "{{ patch_retry_delay | default(180) }}"
-      until: patch_result.failed_update_count | default(0) | int == 0
+      until:
+        - patch_result.failed_update_count | default(0) | int == 0
+        - patch_result.found_update_count | default(0) | int == patch_result.installed_update_count | default(0) | int
       when:
         - enable_patch_install | default(false) | bool
 
@@ -297,6 +329,19 @@
         (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
       register: last_boot_post
       changed_when: false
+
+    - name: "Validar estado real de las firmas de Microsoft Defender"
+      ansible.windows.win_shell: |
+        try {
+          Get-MpComputerStatus |
+          Select-Object AntivirusSignatureVersion, AntivirusSignatureLastUpdated, AntivirusSignatureAge |
+          ConvertTo-Json -Compress
+        } catch {
+          Write-Output "Microsoft Defender no disponible en este servidor"
+        }
+      register: defender_status_post
+      changed_when: false
+      failed_when: false
 
     - name: "Validar si hay reinicio pendiente después del parchado"
       ansible.windows.win_shell: |
@@ -375,6 +420,7 @@
           - "Servidor: {{ inventory_hostname }}"
           - "Ultimo arranque: {{ last_boot_post.stdout | trim }}"
           - "Reinicio pendiente después de parchar: {{ pending_reboot_postcheck.stdout | trim }}"
+          - "Firmas Defender (version/fecha/antiguedad dias): {{ defender_status_post.stdout | default('No disponible') | trim }}"
           - "Ultimos hotfix: {{ hotfix_post.stdout | trim }}"
           - "Actualizaciones pendientes después del parchado: {{ updates_postcheck_result.found_update_count | default(0) }}"
           - "Actualizaciones fallidas en postcheck: {{ updates_postcheck_result.failed_update_count | default(0) }}"
