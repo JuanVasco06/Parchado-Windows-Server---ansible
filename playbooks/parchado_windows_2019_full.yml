@@ -105,6 +105,7 @@
           - "Procesos Windows Update activos: {{ update_processes_precheck.stdout | trim }}"
           - "Actualizaciones encontradas: {{ updates_search_result.found_update_count | default(0) }}"
           - "Actualizaciones fallidas en búsqueda: {{ updates_search_result.failed_update_count | default(0) }}"
+          - "Gestión de Microsoft Defender: {{ 'habilitada' if (enable_defender_management | default(true) | bool) else 'deshabilitada (otro antivirus)' }}"
 
 
 - name: "SNAPSHOT | Crear snapshot/checkpoint previo al parchado (multi-hipervisor)"
@@ -245,6 +246,7 @@
       failed_when: false
       when:
         - enable_patch_install | default(false) | bool
+        - enable_defender_management | default(true) | bool
 
     - name: "Mostrar resultado actualización Defender"
       ansible.builtin.debug:
@@ -253,6 +255,14 @@
           - "{{ defender_update.stdout | default('No ejecutado') | trim }}"
       when:
         - enable_patch_install | default(false) | bool
+        - enable_defender_management | default(true) | bool
+
+    - name: "Informar que la gestión de Defender está deshabilitada para este host"
+      ansible.builtin.debug:
+        msg: "Gestión de Microsoft Defender deshabilitada (enable_defender_management=false). Este servidor usa otro antivirus o no aplica."
+      when:
+        - enable_patch_install | default(false) | bool
+        - not (enable_defender_management | default(true) | bool)
 
     - name: "Forzar escaneo y descarga de Windows Update similar a Retry"
       ansible.windows.win_shell: |
@@ -295,6 +305,27 @@
       until:
         - patch_result.failed_update_count | default(0) | int == 0
         - patch_result.found_update_count | default(0) | int == patch_result.installed_update_count | default(0) | int
+      when:
+        - enable_patch_install | default(false) | bool
+
+    - name: "Forzar deteccion nativa de Windows Update (refresca 'Last checked' y el estado del panel Settings)"
+      ansible.windows.win_shell: |
+        try {
+          (New-Object -ComObject Microsoft.Update.AutoUpdate).DetectNow()
+          Write-Output "Deteccion nativa disparada"
+        } catch {
+          Write-Output "No se pudo disparar deteccion nativa: $($_.Exception.Message)"
+          exit 0
+        }
+      register: native_detect_result
+      changed_when: false
+      failed_when: false
+      when:
+        - enable_patch_install | default(false) | bool
+
+    - name: "Mostrar resultado de la deteccion nativa"
+      ansible.builtin.debug:
+        msg: "{{ native_detect_result.stdout | default('No ejecutado') | trim }}"
       when:
         - enable_patch_install | default(false) | bool
 
@@ -342,6 +373,8 @@
       register: defender_status_post
       changed_when: false
       failed_when: false
+      when:
+        - enable_defender_management | default(true) | bool
 
     - name: "Validar si hay reinicio pendiente después del parchado"
       ansible.windows.win_shell: |
@@ -420,7 +453,7 @@
           - "Servidor: {{ inventory_hostname }}"
           - "Ultimo arranque: {{ last_boot_post.stdout | trim }}"
           - "Reinicio pendiente después de parchar: {{ pending_reboot_postcheck.stdout | trim }}"
-          - "Firmas Defender (version/fecha/antiguedad dias): {{ defender_status_post.stdout | default('No disponible') | trim }}"
+          - "Firmas Defender (version/fecha/antiguedad dias): {{ defender_status_post.stdout | default('Gestión de Defender deshabilitada para este host') | trim }}"
           - "Ultimos hotfix: {{ hotfix_post.stdout | trim }}"
           - "Actualizaciones pendientes después del parchado: {{ updates_postcheck_result.found_update_count | default(0) }}"
           - "Actualizaciones fallidas en postcheck: {{ updates_postcheck_result.failed_update_count | default(0) }}"
