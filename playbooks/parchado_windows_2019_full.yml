@@ -107,45 +107,13 @@
           - "Actualizaciones fallidas en búsqueda: {{ updates_search_result.failed_update_count | default(0) }}"
 
 
-- name: "VMWARE | Crear snapshot previo al parchado"
-  hosts: windows
-  gather_facts: false
-  serial: 1
+
 
   vars:
     snapshot_name: "AWX_PRE_PATCH_{{ inventory_hostname }}_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
     vmware_hostname: "{{ lookup('env', 'VMWARE_HOST') | default('', true) }}"
     vmware_username: "{{ lookup('env', 'VMWARE_USER') | default('', true) }}"
     vmware_password: "{{ lookup('env', 'VMWARE_PASSWORD') | default('', true) }}"
-
-  tasks:
-    - name: "Crear snapshot en VMware antes del parchado"
-      vmware.vmware.vm_snapshot:
-        hostname: "{{ vmware_hostname }}"
-        username: "{{ vmware_username }}"
-        password: "{{ vmware_password }}"
-        validate_certs: "{{ vmware_validate_certs | default(false) }}"
-        datacenter: "{{ vmware_datacenter }}"
-        name: "{{ vmware_vm_name }}"
-        snapshot_name: "{{ snapshot_name }}"
-        description: "Snapshot previo a parchado Windows ejecutado desde AWX sobre {{ inventory_hostname }}"
-        state: present
-      delegate_to: localhost
-      register: snapshot_result
-      when:
-        - enable_vmware_snapshot | default(false) | bool
-        - enable_patch_install | default(false) | bool
-        - vmware_hostname | length > 0
-        - vmware_username | length > 0
-        - vmware_password | length > 0
-        - vmware_vm_name is defined
-
-    - name: "Mostrar resultado snapshot"
-      ansible.builtin.debug:
-        var: snapshot_result
-      when:
-        - enable_vmware_snapshot | default(false) | bool
-
 
 - name: "PATCH | Preparar e instalar actualizaciones Windows Server"
   hosts: windows
