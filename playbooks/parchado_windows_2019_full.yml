@@ -11,6 +11,7 @@
           - "Ejecutado desde AWX"
           - "Ambiente: {{ ambiente_objetivo | default('PRUEBAS') }}"
           - "Snapshot VMware habilitado: {{ enable_vmware_snapshot | default(false) }}"
+          - "Snapshot Hyper-V habilitado: {{ enable_hyperv_snapshot | default(false) }}"
           - "Notificación Teams habilitada: {{ enable_teams_notification | default(false) }}"
           - "Instalación habilitada: {{ enable_patch_install | default(false) }}"
           - "Reinicio habilitado: {{ patch_reboot | default(false) }}"
@@ -107,20 +108,55 @@
           - "Actualizaciones fallidas en búsqueda: {{ updates_search_result.failed_update_count | default(0) }}"
 
 
-
-
-  vars:
-    snapshot_name: "AWX_PRE_PATCH_{{ inventory_hostname }}_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
-    vmware_hostname: "{{ lookup('env', 'VMWARE_HOST') | default('', true) }}"
-    vmware_username: "{{ lookup('env', 'VMWARE_USER') | default('', true) }}"
-    vmware_password: "{{ lookup('env', 'VMWARE_PASSWORD') | default('', true) }}"
-
 - name: "PATCH | Preparar e instalar actualizaciones Windows Server"
   hosts: windows, windows_host
   gather_facts: false
   serial: 1
 
+  vars:
+    # --- VARIABLES DE SNAPSHOTS ---
+    snapshot_name: "AWX_PRE_PATCH_{{ inventory_hostname }}_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+    vmware_hostname: "{{ lookup('env', 'VMWARE_HOST') | default('', true) }}"
+    vmware_username: "{{ lookup('env', 'VMWARE_USER') | default('', true) }}"
+    vmware_password: "{{ lookup('env', 'VMWARE_PASSWORD') | default('', true) }}"
+    # Para Hyper-V (Deberías inyectar estas variables a través de AWX o el Inventario)
+    hyperv_host: "{{ hyperv_server | default('127.0.0.1') }}"
+    hyperv_user: "{{ hyperv_admin | default('Administrador') }}"
+    hyperv_pass: "{{ hyperv_password | default('') }}"
+
   tasks:
+    # ---------------------------------------------------------
+    # BLOQUE DE CREACIÓN DE SNAPSHOTS
+    # ---------------------------------------------------------
+    - name: "SNAPSHOTS | VMware - Crear snapshot previo a la actualización"
+      community.vmware.vmware_guest_snapshot:
+        hostname: "{{ vmware_hostname }}"
+        username: "{{ vmware_username }}"
+        password: "{{ vmware_password }}"
+        validate_certs: false
+        datacenter: "{{ vmware_datacenter | default(omit) }}"
+        name: "{{ vm_name | default(inventory_hostname) }}"
+        state: present
+        snapshot_name: "{{ snapshot_name }}"
+        description: "Snapshot automático creado por AWX previo a parcheo."
+      delegate_to: localhost
+      run_once: false
+      when: 
+        - enable_vmware_snapshot | default(false) | bool
+
+    - name: "SNAPSHOTS | Hyper-V - Crear Checkpoint previo a la actualización"
+      ansible.windows.win_shell: |
+        Checkpoint-VM -Name "{{ vm_name | default(inventory_hostname) }}" -SnapshotName "{{ snapshot_name }}"
+      delegate_to: "{{ hyperv_host }}"
+      vars:
+        ansible_user: "{{ hyperv_user }}"
+        ansible_password: "{{ hyperv_pass }}"
+        ansible_connection: winrm
+        ansible_winrm_server_cert_validation: ignore
+      when: 
+        - enable_hyperv_snapshot | default(false) | bool
+    # ---------------------------------------------------------
+
     - name: "Asegurar servicios requeridos para Windows Update"
       ansible.windows.win_service:
         name: "{{ item }}"
