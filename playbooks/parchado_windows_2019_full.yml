@@ -18,7 +18,7 @@
 
 
 - name: "VALIDACION | Precheck y busqueda de parches en Windows"
-  hosts: windows
+  hosts: windows, windows_host
   gather_facts: false
   serial: 1
 
@@ -116,7 +116,7 @@
     vmware_password: "{{ lookup('env', 'VMWARE_PASSWORD') | default('', true) }}"
 
 - name: "PATCH | Preparar e instalar actualizaciones Windows Server"
-  hosts: windows
+  hosts: windows, windows_host
   gather_facts: false
   serial: 1
 
@@ -224,7 +224,7 @@
 
 
 - name: "POSTCHECK | Validación posterior al parchado"
-  hosts: windows
+  hosts: windows, windows_host
   gather_facts: false
   serial: 1
 
