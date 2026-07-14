@@ -12,7 +12,7 @@
       ansible.builtin.debug:
         msg:
           - "Inicio de flujo de parchado Windows Server"
-          - "Cliente: {{ cliente_nombre | default(tower_organization_name | default('No definido')) }}"
+          - "Cliente: {{ cliente_nombre | default('No definido') }}"
           - "Ejecutado desde AWX"
           - "Ambiente: {{ ambiente_objetivo | default('PRUEBAS') }}"
           - "Snapshot/checkpoint habilitado: {{ enable_snapshot | default(false) }}"
@@ -557,7 +557,7 @@
                     [
                       {
                         "type": "TextBlock",
-                        "text": "Parchado Windows Server - " ~ (cliente_nombre | default(tower_organization_name | default('Cliente no definido'))),
+                        "text": "Parchado Windows Server - " ~ (cliente_nombre | default('Cliente no definido')),
                         "weight": "Bolder",
                         "size": "Large",
                         "wrap": true
