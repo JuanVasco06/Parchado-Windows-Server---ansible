@@ -4,10 +4,15 @@
   gather_facts: false
 
   tasks:
+    - name: "Inicializar resumen global de parchado"
+      ansible.builtin.set_fact:
+        resumen_parchado: []
+
     - name: "Mostrar información inicial"
       ansible.builtin.debug:
         msg:
           - "Inicio de flujo de parchado Windows Server"
+          - "Cliente: {{ cliente_nombre | default(tower_organization_name | default('No definido')) }}"
           - "Ejecutado desde AWX"
           - "Ambiente: {{ ambiente_objetivo | default('PRUEBAS') }}"
           - "Snapshot/checkpoint habilitado: {{ enable_snapshot | default(false) }}"
@@ -461,6 +466,21 @@
           - "Servicios criticos: {{ critical_services_status.stdout | default('No definidos') | trim }}"
           - "Eventos recientes Windows Update: {{ windows_update_events.stdout | default('Sin eventos') | trim }}"
 
+    - name: "Agregar resultado de este servidor al resumen global para Teams"
+      ansible.builtin.set_fact:
+        resumen_parchado: "{{ hostvars['localhost'].resumen_parchado + [ {
+          'host': inventory_hostname,
+          'hipervisor': hypervisor_type | default('n/a'),
+          'encontradas': patch_result.found_update_count | default(0),
+          'instaladas': patch_result.installed_update_count | default(0),
+          'fallidas_patch': patch_result.failed_update_count | default(0),
+          'reinicio_pendiente': pending_reboot_postcheck.stdout | default('') | trim,
+          'defender_info': defender_status_post.stdout | default('Gestión Defender deshabilitada') | trim,
+          'pendientes_post': updates_postcheck_result.found_update_count | default(0)
+        } ] }}"
+      delegate_to: localhost
+      delegate_facts: true
+
     - name: "Advertir si aún quedan actualizaciones pendientes"
       ansible.builtin.debug:
         msg:
@@ -477,7 +497,7 @@
         - pending_reboot_postcheck.stdout | trim | lower == "true"
 
 
-- name: "CIERRE | Notificar resultado final a Teams"
+- name: "CIERRE | Notificar resumen consolidado a Teams"
   hosts: localhost
   gather_facts: false
 
@@ -485,7 +505,39 @@
     teams_webhook_url: "{{ lookup('env', 'TEAMS_WEBHOOK_URL') | default('', true) }}"
 
   tasks:
-    - name: "Notificar finalización a Teams"
+    - name: "Construir bloques de Adaptive Card, uno por servidor"
+      ansible.builtin.set_fact:
+        teams_card_blocks: >-
+          {{ teams_card_blocks | default([]) + [{
+            "type": "FactSet",
+            "facts": [
+              {"title": "Servidor", "value": item.host},
+              {"title": "Hipervisor", "value": item.hipervisor},
+              {"title": "Encontradas", "value": item.encontradas | string},
+              {"title": "Instaladas", "value": item.instaladas | string},
+              {"title": "Fallidas", "value": item.fallidas_patch | string},
+              {"title": "Reinicio pendiente", "value": item.reinicio_pendiente},
+              {"title": "Pendientes tras patch", "value": item.pendientes_post | string},
+              {"title": "Defender", "value": item.defender_info}
+            ]
+          }] }}
+      loop: "{{ resumen_parchado }}"
+      when:
+        - enable_teams_notification | default(false) | bool
+        - teams_webhook_url | length > 0
+
+    - name: "Calcular totales globales del job"
+      ansible.builtin.set_fact:
+        total_servidores: "{{ resumen_parchado | length }}"
+        total_instaladas: "{{ resumen_parchado | sum(attribute='instaladas') }}"
+        total_fallidas: "{{ resumen_parchado | sum(attribute='fallidas_patch') }}"
+        total_pendientes: "{{ resumen_parchado | sum(attribute='pendientes_post') }}"
+      when:
+        - enable_teams_notification | default(false) | bool
+        - teams_webhook_url | length > 0
+        - resumen_parchado | length > 0
+
+    - name: "Notificar resumen consolidado a Teams"
       ansible.builtin.uri:
         url: "{{ teams_webhook_url }}"
         method: POST
@@ -493,7 +545,47 @@
         headers:
           Content-Type: "application/json"
         body:
-          text: "Finalizó el flujo de parchado Windows Server desde AWX. Validar logs del Job para evidencias."
+          type: "message"
+          attachments:
+            - contentType: "application/vnd.microsoft.card.adaptive"
+              content:
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json"
+                type: "AdaptiveCard"
+                version: "1.4"
+                body: >-
+                  {{
+                    [
+                      {
+                        "type": "TextBlock",
+                        "text": "Parchado Windows Server - " ~ (cliente_nombre | default(tower_organization_name | default('Cliente no definido'))),
+                        "weight": "Bolder",
+                        "size": "Large",
+                        "wrap": true
+                      },
+                      {
+                        "type": "TextBlock",
+                        "text": "Ambiente: " ~ (ambiente_objetivo | default('PRUEBAS')) ~ " · Job AWX: " ~ (tower_job_id | default('N/A') | string),
+                        "isSubtle": true,
+                        "wrap": true
+                      },
+                      {
+                        "type": "FactSet",
+                        "facts": [
+                          {"title": "Servidores procesados", "value": total_servidores | default(0) | string},
+                          {"title": "Total instaladas", "value": total_instaladas | default(0) | string},
+                          {"title": "Total fallidas", "value": total_fallidas | default(0) | string},
+                          {"title": "Total pendientes post-parchado", "value": total_pendientes | default(0) | string}
+                        ]
+                      },
+                      {
+                        "type": "TextBlock",
+                        "text": "Detalle por servidor:",
+                        "weight": "Bolder",
+                        "wrap": true,
+                        "spacing": "Medium"
+                      }
+                    ] + (teams_card_blocks | default([]))
+                  }}
         status_code:
           - 200
           - 202
