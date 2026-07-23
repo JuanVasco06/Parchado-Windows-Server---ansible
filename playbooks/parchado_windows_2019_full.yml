@@ -313,26 +313,110 @@
       when:
         - enable_patch_install | default(false) | bool
 
-    - name: "Forzar deteccion nativa de Windows Update (refresca 'Last checked' y el estado del panel Settings)"
+    # ------------------------------------------------------------------------
+    # RECONCILIACION DE USO (Update Session Orchestrator)
+    #
+    # El playbook instala via WUA (API COM), pero el panel "Configuracion >
+    # Windows Update" lee de USO, que mantiene su propia cache de escaneo.
+    # Sin esto, el panel puede seguir mostrando actualizaciones como
+    # "Pending install" aunque Get-HotFix confirme que ya se instalaron,
+    # generando falsas alarmas al revisar el servidor manualmente.
+    # ------------------------------------------------------------------------
+    - name: "Reconciliar estado de USO para que el panel de Settings refleje el resultado real"
       ansible.windows.win_shell: |
+        $ErrorActionPreference = 'SilentlyContinue'
+        $r = @()
+
+        # 1. Reiniciar el orquestador para que suelte la cache del escaneo previo
         try {
-          (New-Object -ComObject Microsoft.Update.AutoUpdate).DetectNow()
-          Write-Output "Deteccion nativa disparada"
+          Restart-Service -Name UsoSvc -Force -ErrorAction Stop
+          Start-Sleep -Seconds 10
+          $r += "UsoSvc reiniciado"
         } catch {
-          Write-Output "No se pudo disparar deteccion nativa: $($_.Exception.Message)"
-          exit 0
+          $r += "UsoSvc no reiniciado: $($_.Exception.Message)"
         }
-      register: native_detect_result
+
+        # 2. Refrescar configuracion de politicas en USO
+        UsoClient RefreshSettings
+        Start-Sleep -Seconds 10
+
+        # 3. Escaneo nativo del orquestador (esto SI actualiza el panel de Settings)
+        try {
+          Start-ScheduledTask -TaskName "\Microsoft\Windows\UpdateOrchestrator\Schedule Scan" -ErrorAction Stop
+          Start-Sleep -Seconds 60
+          $r += "Schedule Scan ejecutada"
+        } catch {
+          $r += "Schedule Scan no disponible, se intenta StartInteractiveScan"
+          UsoClient StartInteractiveScan
+          Start-Sleep -Seconds 45
+        }
+
+        # 4. Reportar como quedo el estado visible tras la reconciliacion
+        try {
+          $session = New-Object -ComObject Microsoft.Update.Session
+          $searcher = $session.CreateUpdateSearcher()
+          $pendientes = $searcher.Search("IsInstalled=0 and IsHidden=0").Updates.Count
+          $r += "Pendientes visibles tras reconciliacion: $pendientes"
+        } catch {
+          $r += "No se pudo consultar pendientes tras reconciliacion"
+        }
+
+        $r -join " | "
+      register: uso_refresh_result
       changed_when: false
       failed_when: false
       when:
         - enable_patch_install | default(false) | bool
 
-    - name: "Mostrar resultado de la deteccion nativa"
+    - name: "Mostrar resultado de la reconciliacion de USO"
       ansible.builtin.debug:
-        msg: "{{ native_detect_result.stdout | default('No ejecutado') | trim }}"
+        msg: "{{ uso_refresh_result.stdout | default('No ejecutado') | trim }}"
       when:
         - enable_patch_install | default(false) | bool
+
+    # ------------------------------------------------------------------------
+    # OPCION CONTUNDENTE (desactivada por defecto)
+    #
+    # Si tras la reconciliacion anterior el panel SIGUE mostrando pendientes
+    # fantasma, se puede resetear el datastore de Windows Update.
+    #
+    # ATENCION: esto borra el HISTORIAL de actualizaciones que muestra el panel
+    # ("Ver historial de actualizaciones" queda vacio). NO afecta los parches
+    # instalados ni Get-HotFix, pero se pierde la traza visual historica.
+    # Activar solo por host, con: reset_update_datastore: true
+    # ------------------------------------------------------------------------
+    - name: "Resetear datastore de Windows Update para limpiar estado cacheado del panel"
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'SilentlyContinue'
+        $stamp = Get-Date -Format yyyyMMdd_HHmmss
+
+        Stop-Service -Name UsoSvc, wuauserv -Force
+        Start-Sleep -Seconds 5
+
+        if (Test-Path "C:\Windows\SoftwareDistribution\DataStore") {
+          Rename-Item "C:\Windows\SoftwareDistribution\DataStore" "DataStore.old_$stamp"
+        }
+
+        Start-Service -Name wuauserv, UsoSvc
+        Start-Sleep -Seconds 15
+
+        Start-ScheduledTask -TaskName "\Microsoft\Windows\UpdateOrchestrator\Schedule Scan"
+        Start-Sleep -Seconds 90
+
+        Write-Output "Datastore reseteado (respaldo: DataStore.old_$stamp) y rescan disparado"
+      register: uso_reset_result
+      changed_when: true
+      failed_when: false
+      when:
+        - enable_patch_install | default(false) | bool
+        - reset_update_datastore | default(false) | bool
+
+    - name: "Mostrar resultado del reset del datastore"
+      ansible.builtin.debug:
+        msg: "{{ uso_reset_result.stdout | default('No ejecutado') | trim }}"
+      when:
+        - enable_patch_install | default(false) | bool
+        - reset_update_datastore | default(false) | bool
 
     - name: "Mostrar resultado de instalación"
       ansible.builtin.debug:
