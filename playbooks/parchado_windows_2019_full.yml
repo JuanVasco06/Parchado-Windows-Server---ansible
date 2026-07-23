@@ -542,6 +542,7 @@
         url: "{{ teams_webhook_url }}"
         method: POST
         body_format: json
+        timeout: 90
         headers:
           Content-Type: "application/json"
         body:
@@ -589,6 +590,19 @@
         status_code:
           - 200
           - 202
+      register: teams_notify_result
+      retries: 2
+      delay: 5
+      until: teams_notify_result.status | default(-1) in [200, 202]
+      ignore_errors: true
       when:
         - enable_teams_notification | default(false) | bool
         - teams_webhook_url | length > 0
+
+    - name: "Advertir si la notificación a Teams no se pudo enviar"
+      ansible.builtin.debug:
+        msg: "ADVERTENCIA: no se pudo notificar a Teams tras varios intentos. El parchado en sí no se vio afectado. Detalle: {{ teams_notify_result.msg | default('sin detalle') }}"
+      when:
+        - enable_teams_notification | default(false) | bool
+        - teams_webhook_url | length > 0
+        - teams_notify_result is failed
